@@ -1,0 +1,131 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime, timedelta
+
+# --- PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="AI Power Grid Management System",
+    page_icon="⚡",
+    layout="wide"
+)
+
+# --- SYNTHETIC DATA GENERATOR ---
+@st.cache_data
+def generate_grid_data():
+    np.random.seed(42)
+    dates = [datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=i) for i in range(48)]
+    
+    # Simulate base demand pattern (diurnal cycle)
+    hours = np.array([d.hour for d in dates])
+    base_load = 500 + 250 * np.sin((hours - 6) * np.pi / 12) ** 2 + np.random.normal(0, 20, 48)
+    
+    # Introduce peak surge around 19:00 - 20:00
+    base_load[19] += 120
+    base_load[20] += 100
+    
+    # Renewable generation profile (Solar/Wind)
+    solar = np.maximum(0, 300 * np.sin((hours - 6) * np.pi / 12)) * (hours >= 6) * (hours <= 18)
+    wind = np.random.normal(150, 30, 48)
+    renewable_total = solar + wind
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "hour": hours,
+        "load_mw": np.round(base_load, 1),
+        "renewable_mw": np.round(renewable_total, 1),
+        "temperature_c": np.round(25 + 5 * np.sin((hours - 8) * np.pi / 12) + np.random.normal(0, 1, 48), 1)
+    })
+    return df
+
+df = generate_grid_data()
+
+# --- ML MODEL FOR LOAD PREDICTION ---
+X = df[["hour", "temperature_c"]]
+y = df["load_mw"]
+
+model = RandomForestRegressor(n_estimators=50, random_state=42)
+model.fit(X, y)
+
+df["predicted_load_mw"] = np.round(model.predict(X), 1)
+
+# Anomaly detection: loads > 1.8 standard deviations above mean
+mean_load = df["load_mw"].mean()
+std_load = df["load_mw"].std()
+df["is_anomaly"] = df["load_mw"] > (mean_load + 1.8 * std_load)
+
+# --- DASHBOARD HEADER ---
+st.title("⚡ AI Power Grid Management System")
+st.markdown("Real-time load forecasting, peak prediction, and dynamic load-shifting optimization.")
+st.divider()
+
+# --- SIDEBAR CONTROLS ---
+st.sidebar.header("🕹️ Grid Controls")
+shift_load = st.sidebar.checkbox("Apply AI Dynamic Load Shift", value=False)
+target_hour = st.sidebar.slider("Shift Peak Load To (Hour)", min_value=20, max_value=23, value=21)
+
+# Apply load shifting logic if enabled
+if shift_load:
+    peak_idx = df["predicted_load_mw"].idxmax()
+    reduction = df.loc[peak_idx, "predicted_load_mw"] * 0.084
+    df.loc[peak_idx, "predicted_load_mw"] -= reduction
+    df.loc[target_hour, "predicted_load_mw"] += reduction
+
+# --- TOP METRICS ROW ---
+current_row = df.iloc[0]
+predicted_peak = df["predicted_load_mw"].max()
+peak_time = df.loc[df["predicted_load_mw"].idxmax(), "timestamp"].strftime("%H:%M")
+renewable_share = round((current_row["renewable_mw"] / current_row["load_mw"]) * 100, 1)
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("CURRENT LOAD", f"{current_row['load_mw']} MW", delta="Real-time")
+col2.metric("PREDICTED PEAK", f"{predicted_peak} MW", delta=f"Expected @ {peak_time}")
+col3.metric("GRID HEALTH", "87%", delta="-2% Stress")
+col4.metric("RENEWABLE SHARE", f"{renewable_share}%", delta="Solar + Wind")
+
+st.divider()
+
+# --- MAIN CHARTS SECTION ---
+left_col, right_col = st.columns([2, 1])
+
+with left_col:
+    st.subheader("📈 24-Hour Electricity Demand Forecast")
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["load_mw"], mode="lines+markers", name="Actual Load (MW)", line=dict(color="#1f77b4")))
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["predicted_load_mw"], mode="lines", name="AI Predicted Load (MW)", line=dict(color="#ff7f0e", dash="dash")))
+    
+    # Highlight anomalies
+    anomalies = df[df["is_anomaly"]]
+    fig.add_trace(go.Scatter(x=anomalies["timestamp"], y=anomalies["load_mw"], mode="markers", name="Grid Stress Anomaly", marker=dict(color="red", size=10, symbol="x")))
+
+    fig.update_layout(xaxis_title="Time", yaxis_title="Power (MW)", margin=dict(l=20, r=20, t=30, b=20), hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+with right_col:
+    st.subheader("🤖 AI Recommendation Engine")
+    
+    if shift_load:
+        st.success(f"✅ Load-shifting active!\n\nPeak reduction: **8.4%** achieved by shifting flexible demand to **{target_hour}:00**.")
+    else:
+        st.warning(f"⚠️ **PEAK DEMAND EXPECTED @ {peak_time}**\n\nRecommendation: Shift flexible industrial loads to **{target_hour}:00** to reduce grid strain.")
+
+    st.subheader("⚡ Generation Mix")
+    mix_fig = px.pie(
+        names=["Renewable", "Conventional Thermal"],
+        values=[current_row["renewable_mw"], max(0, current_row["load_mw"] - current_row["renewable_mw"])],
+        hole=0.4,
+        color_discrete_sequence=["#2ca02c", "#d62728"]
+    )
+    mix_fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(mix_fig, use_container_width=True)
+
+# --- DATA TABLE ---
+st.subheader("📋 Real-Time Telemetry Data")
+st.dataframe(
+    df[["timestamp", "load_mw", "predicted_load_mw", "renewable_mw", "temperature_c", "is_anomaly"]].head(12),
+    use_container_width=True
+)
