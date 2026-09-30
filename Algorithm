@@ -1,0 +1,124 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime, timedelta
+
+
+class PowerGridAI:
+    def __init__(self):
+        # Model for demand forecasting
+        self.model = RandomForestRegressor(n_estimators=50, random_state=42)
+        self.is_trained = False
+
+    def generate_synthetic_data(self, hours_ahead=48):
+        """Generates realistic grid data: load, renewables, temperature."""
+        np.random.seed(42)
+        dates = [
+            datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=i)
+            for i in range(hours_ahead)
+        ]
+        
+        hours = np.array([d.hour for d in dates])
+        
+        # Base load pattern with peak around 19:00
+        base_load = 500 + 250 * np.sin((hours - 6) * np.pi / 12) ** 2 + np.random.normal(0, 20, hours_ahead)
+        base_load[19] += 120  # Evening peak spike
+        base_load[20] += 100
+
+        # Renewable profile (Solar during day, Wind intermittent)
+        solar = np.maximum(0, 300 * np.sin((hours - 6) * np.pi / 12)) * (hours >= 6) * (hours <= 18)
+        wind = np.random.normal(150, 30, hours_ahead)
+        renewable_total = solar + wind
+
+        temperature = 25 + 5 * np.sin((hours - 8) * np.pi / 12) + np.random.normal(0, 1, hours_ahead)
+
+        df = pd.DataFrame({
+            "timestamp": dates,
+            "hour": hours,
+            "load_mw": np.round(base_load, 1),
+            "renewable_mw": np.round(renewable_total, 1),
+            "temperature_c": np.round(temperature, 1)
+        })
+        return df
+
+    def train_model(self, df):
+        """Trains Random Forest model on historical load patterns."""
+        X = df[["hour", "temperature_c"]]
+        y = df["load_mw"]
+        self.model.fit(X, y)
+        self.is_trained = True
+
+    def predict_demand(self, df):
+        """Generates load predictions and detects grid stress anomalies."""
+        if not self.is_trained:
+            self.train_model(df)
+            
+        X = df[["hour", "temperature_c"]]
+        df["predicted_load_mw"] = np.round(self.model.predict(X), 1)
+
+        # Anomaly Detection: Loads exceeding 1.8 standard deviations
+        mean_load = df["load_mw"].mean()
+        std_load = df["load_mw"].std()
+        df["is_anomaly"] = df["load_mw"] > (mean_load + 1.8 * std_load)
+        
+        return df
+
+    def optimize_load_shift(self, df, shift_percentage=0.084, target_hour=21):
+        """
+        Shifts peak demand load to off-peak hours.
+        - shift_percentage: Default 8.4% peak reduction
+        - target_hour: Target off-peak hour to relocate demand
+        """
+        df_shifted = df.copy()
+        peak_idx = df_shifted["predicted_load_mw"].idxmax()
+        
+        # Calculate shifted power amount
+        peak_load = df_shifted.loc[peak_idx, "predicted_load_mw"]
+        reduction = peak_load * shift_percentage
+
+        # Apply reduction at peak and re-allocate to target hour
+        df_shifted.loc[peak_idx, "predicted_load_mw"] -= reduction
+        
+        # Find matching row index for target hour
+        target_indices = df_shifted[df_shifted["hour"] == target_hour].index
+        if len(target_indices) > 0:
+            df_shifted.loc[target_indices[0], "predicted_load_mw"] += reduction
+
+        return df_shifted, round(reduction, 1)
+
+    def calculate_grid_metrics(self, df):
+        """Computes summary metrics for the grid dashboard."""
+        current_row = df.iloc[0]
+        peak_idx = df["predicted_load_mw"].idxmax()
+        
+        predicted_peak = df.loc[peak_idx, "predicted_load_mw"]
+        peak_time = df.loc[peak_idx, "timestamp"].strftime("%H:%M")
+        
+        renewable_share = round((current_row["renewable_mw"] / current_row["load_mw"]) * 100, 1)
+        
+        # Grid health heuristic based on load vs peak capacity (e.g., 950 MW max)
+        capacity_usage = current_row["load_mw"] / 950.0
+        grid_health = int(np.clip(100 - (capacity_usage * 20), 60, 100))
+
+        return {
+            "current_load": current_row["load_mw"],
+            "predicted_peak": predicted_peak,
+            "peak_time": peak_time,
+            "grid_health": f"{grid_health}%",
+            "renewable_share": f"{renewable_share}%"
+        }
+
+
+# --- QUICK TEST RUN ---
+if __name__ == "__main__":
+    ai = PowerGridAI()
+    data = ai.generate_synthetic_data()
+    data = ai.predict_demand(data)
+    
+    metrics = ai.calculate_grid_metrics(data)
+    print("=== GRID METRICS ===")
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+        
+    shifted_data, reduction = ai.optimize_load_shift(data)
+    print(f"\nOptimization Result: Reduced peak load by {reduction} MW.")
